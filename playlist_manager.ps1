@@ -1,13 +1,13 @@
 $ErrorActionPreference = "Continue"
 
-$Desktop = "C:\Users\ovittin019\Desktop"
+$Desktop = [Environment]::GetFolderPath("Desktop")
 $Format  = "m4a"
 $Threads = 4
 
 $playlists = @(
-    @{ Nome = "Trap"; Folder = "C:\Users\ovittin019\Desktop\Trap"; Csv = "Trap.csv"; OriginalM3u = Join-Path $Desktop "Trap.m3u" },
-    @{ Nome = "Zona Febril"; Folder = "C:\Users\ovittin019\Desktop\Zona Febril"; Csv = "Zona_febril_emojis.csv"; OriginalM3u = Join-Path $Desktop "Zona febril emojis.m3u" },
-    @{ Nome = "FBC Yago Oproprio"; Folder = "C:\Users\ovittin019\Desktop\Fbc_YagoOproprio"; Csv = "FbcYagoOproprio.csv"; OriginalM3u = Join-Path $Desktop "Fbc_YagoOproprio.m3u" }
+    @{ Nome = "Trap"; Folder = Join-Path $Desktop "Trap"; Csv = "Trap.csv"; OriginalM3u = Join-Path $Desktop "Trap.m3u" },
+    @{ Nome = "Zona Febril"; Folder = Join-Path $Desktop "Zona Febril"; Csv = "Zona_febril_emojis.csv"; OriginalM3u = Join-Path $Desktop "Zona febril emojis.m3u" },
+    @{ Nome = "FBC Yago Oproprio"; Folder = Join-Path $Desktop "Fbc_YagoOproprio"; Csv = "FbcYagoOproprio.csv"; OriginalM3u = Join-Path $Desktop "Fbc_YagoOproprio.m3u" }
 )
 
 $pastaExtrasCombinadas = Join-Path $Desktop "Extras_Combinadas"
@@ -59,6 +59,7 @@ function Get-NormalizedKey($texto) {
 }
 
 function Get-ChaveOrdenacao($texto) {
+    if ([string]::IsNullOrWhiteSpace($texto)) { return "" }
     $n = Remove-Diacritics $texto
     return $n.ToLowerInvariant().Trim()
 }
@@ -69,6 +70,7 @@ function Get-Artista($baseName) {
 }
 
 function Get-SafeName($nome) {
+    if ([string]::IsNullOrWhiteSpace($nome)) { return "" }
     return ($nome -replace '[\\/:*?"<>|]', '_' -replace '\s+', ' ').Trim()
 }
 
@@ -93,9 +95,23 @@ function Convert-UriToUrl($uri) {
     return $null
 }
 
+function Get-TrackUrlFromValue($value) {
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    $text = $value.Trim()
+    if ($text -match 'spotify:track:([A-Za-z0-9]+)') { return "https://open.spotify.com/track/$($matches[1])" }
+    if ($text -match 'https?://') { return $text }
+    return $null
+}
+
 function Get-AudioFileCount($folder) {
     if (-not (Test-Path -LiteralPath $folder)) { return 0 }
-    return @((Get-ChildItem -LiteralPath $folder -Filter "*.$Format" -ErrorAction SilentlyContinue)).Count
+    return @((Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -ieq ".m4a" })).Count
+}
+
+function Ensure-Folder($folder) {
+    if (-not [string]::IsNullOrWhiteSpace($folder) -and -not (Test-Path -LiteralPath $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    }
 }
 
 function Build-Indice($pastas) {
@@ -115,39 +131,335 @@ function Build-Indice($pastas) {
     return @{ PorNome = $porNome; PorChave = $porChave }
 }
 
+function Read-PlaylistCsv($csvPath) {
+    if (-not (Test-Path -LiteralPath $csvPath)) { return @() }
+
+    $items = @()
+    try {
+        $rows = Import-Csv -LiteralPath $csvPath -Encoding UTF8
+    }
+    catch {
+        try {
+            $rows = Import-Csv -LiteralPath $csvPath -Encoding Default
+        }
+        catch {
+            Write-Warning "Nao foi possivel ler CSV: $csvPath"
+            return @()
+        }
+    }
+
+    foreach ($row in $rows) {
+        if ($null -eq $row) { continue }
+
+        $title = $null
+        foreach ($candidate in @('Title', 'title', 'Name', 'name', 'Track', 'track', 'Song', 'song', 'Musica', 'Música', 'Music', 'music')) {
+            if ($row.PSObject.Properties.Name -contains $candidate -and -not [string]::IsNullOrWhiteSpace($row.$candidate)) {
+                $title = $row.$candidate
+                break
+            }
+        }
+
+        $uri = $null
+        foreach ($candidate in @('SpotifyUrl', 'spotify_url', 'spotifyUrl', 'URL', 'Url', 'url', 'TrackUrl', 'track_url', 'uri', 'URI', 'spotify_uri', 'Spotify URI')) {
+            if ($row.PSObject.Properties.Name -contains $candidate -and -not [string]::IsNullOrWhiteSpace($row.$candidate)) {
+                $uri = $row.$candidate
+                break
+            }
+        }
+
+        if (-not $title -and $uri) { $title = $uri }
+        if (-not $title -and -not $uri) { continue }
+
+        $items += [pscustomobject]@{
+            Title = $title
+            Url   = Get-TrackUrlFromValue $uri
+            Raw   = $row
+        }
+    }
+
+    return $items
+}
+
+function Get-FileHashKey($filePath) {
+    if (-not (Test-Path -LiteralPath $filePath)) { return $null }
+    try {
+        return (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-PlaylistMissingEntries($playlist) {
+    $csvPath = Join-Path $playlist.Folder $playlist.Csv
+    if (-not (Test-Path -LiteralPath $csvPath)) { return @() }
+
+    $entries = Read-PlaylistCsv $csvPath
+    $files = @(Get-ChildItem -LiteralPath $playlist.Folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -ieq ".m4a" })
+    $index = @{}
+    foreach ($file in $files) {
+        $key = Get-NormalizedKey $file.BaseName
+        if (-not [string]::IsNullOrWhiteSpace($key)) { $index[$key] = $file }
+    }
+
+    $faltantes = @()
+    foreach ($entry in $entries) {
+        $key = Get-NormalizedKey $entry.Title
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        if (-not $index.ContainsKey($key)) {
+            $faltantes += $entry
+        }
+    }
+
+    return $faltantes
+}
+
+function Invoke-SpotifyDownload($url, $folder) {
+    if ([string]::IsNullOrWhiteSpace($url)) { return $false }
+    Ensure-Folder $folder
+
+    $args = @(
+        '--format', $Format,
+        '--output', $folder,
+        '--threads', [string]$Threads,
+        '--overwrite', 'skip',
+        $url
+    )
+
+    $output = & spotdl @args 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($output) {
+        $output | ForEach-Object { Write-Info $_ }
+    }
+
+    return ($exitCode -eq 0)
+}
+
+function Get-M3uEntries($m3uPath) {
+    if (-not (Test-Path -LiteralPath $m3uPath)) { return @() }
+    $lines = Get-Content -LiteralPath $m3uPath -ErrorAction SilentlyContinue
+    $entries = @()
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        $entries += $trimmed
+    }
+    return $entries
+}
+
+function Set-M3uEntries($m3uPath, $entries) {
+    $content = @()
+    foreach ($entry in $entries) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $content += $entry
+    }
+    Set-Content -LiteralPath $m3uPath -Value $content -Encoding UTF8
+}
+
 function Invoke-Modulo1-GerenciarPlaylists {
     Clear-Host
     Write-Header "MODULO 1 - SPOTDL MANAGER"
 
-    if (-not (Test-Spotdl)) { Write-ErrorMsg "spotdl nao encontrado"; return }
+    if (-not (Test-Spotdl)) {
+        Write-ErrorMsg "spotdl nao encontrado. Instale com: pip install spotdl"
+        return
+    }
     Write-Success "spotdl encontrado"
 
     foreach ($p in $playlists) {
         Write-Header "PLAYLIST: $($p.Nome)"
-        $csvPath = Join-Path $p.Folder $p.Csv
-        if (-not (Test-Path -LiteralPath $p.Folder)) { Write-ErrorMsg "Pasta nao existe"; continue }
-        if (-not (Test-Path -LiteralPath $csvPath)) { Write-ErrorMsg "CSV nao existe"; continue }
-        Write-Success "Modulo 1 pronto para: $($p.Nome)"
+        $folder = $p.Folder
+        $csvPath = Join-Path $folder $p.Csv
+
+        if (-not (Test-Path -LiteralPath $folder)) {
+            Write-ErrorMsg "Pasta nao existe: $folder"
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $csvPath)) {
+            Write-ErrorMsg "CSV nao existe: $csvPath"
+            continue
+        }
+
+        $entries = Read-PlaylistCsv $csvPath
+        $faltantes = Get-PlaylistMissingEntries $p
+
+        Write-Success "CSV carregado: $($entries.Count) entradas"
+        Write-Success "Pasta validada: $folder"
+
+        if ($faltantes.Count -gt 0) {
+            Write-Warning "Existem $($faltantes.Count) itens faltando na pasta"
+            foreach ($item in $faltantes) {
+                $title = if ($item.Title) { $item.Title } else { "sem nome" }
+                Write-Info "- faltando: $title"
+            }
+        }
+        else {
+            Write-Success "Nenhuma musica faltando"
+        }
+
+        if ($p.OriginalM3u -and (Test-Path -LiteralPath $p.OriginalM3u)) {
+            Write-Success "M3U original encontrado: $($p.OriginalM3u)"
+        }
     }
 }
 
 function Invoke-Modulo2-RemoverDuplicatas {
     Clear-Host
     Write-Header "MODULO 2 - REMOVER DUPLICATAS"
-    Write-Success "Modulo 2 pronto"
+
+    $pastas = @()
+    foreach ($p in $playlists) {
+        if ($p.Folder) { $pastas += $p.Folder }
+    }
+
+    foreach ($pasta in $pastas) {
+        if (-not (Test-Path -LiteralPath $pasta)) { continue }
+
+        $arquivos = @(Get-ChildItem -LiteralPath $pasta -File -ErrorAction SilentlyContinue)
+        if ($arquivos.Count -le 1) { continue }
+
+        $processados = @{}
+        $remover = @()
+
+        foreach ($arquivo in $arquivos) {
+            if ($processados.ContainsKey($arquivo.FullName)) { continue }
+            $processados[$arquivo.FullName] = $true
+
+            $hash = Get-FileHashKey $arquivo.FullName
+            $key = Get-NormalizedKey $arquivo.BaseName
+
+            foreach ($outro in $arquivos) {
+                if ($outro.FullName -eq $arquivo.FullName) { continue }
+                if ($processados.ContainsKey($outro.FullName)) { continue }
+
+                $sameHash = $hash -and (Get-FileHashKey $outro.FullName) -and ($hash -eq (Get-FileHashKey $outro.FullName))
+                $sameKey = ($key -and (Get-NormalizedKey $outro.BaseName) -and ($key -eq (Get-NormalizedKey $outro.BaseName)))
+
+                if ($sameHash -or $sameKey) {
+                    $candidato = $outro
+                    if ($arquivo.Length -ge $candidato.Length) {
+                        $remover += $candidato.FullName
+                        $processados[$outro.FullName] = $true
+                    }
+                    else {
+                        $remover += $arquivo.FullName
+                        $processados[$arquivo.FullName] = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if ($remover.Count -eq 0) {
+            Write-Success "Nenhuma duplicata encontrada em $pasta"
+            continue
+        }
+
+        $remover = $remover | Sort-Object -Unique
+
+        foreach ($fileToDelete in $remover) {
+            $nome = Split-Path $fileToDelete -Leaf
+            if ($ArquivosProtegidos -contains $nome.ToLowerInvariant()) {
+                Write-Warning "Arquivo protegido, ignorado: $nome"
+                continue
+            }
+
+            if ($ApagarPermanentemente) {
+                Remove-Item -LiteralPath $fileToDelete -Force -ErrorAction SilentlyContinue
+                Write-Del "Removido: $nome"
+            }
+            else {
+                Write-Warning "Duplicata detectada (nao removida por seguranca): $nome"
+            }
+        }
+    }
 }
 
 function Invoke-Modulo3-CorrigirM3u {
     Clear-Host
     Write-Header "MODULO 3 - CORRIGIR M3U"
-    Write-Success "Modulo 3 pronto"
+
+    $m3uList = @($playlists | ForEach-Object { $_.OriginalM3u }) + @($playlistsCombinadas | ForEach-Object { $_.M3u })
+
+    foreach ($m3u in $m3uList) {
+        if (-not $m3u) { continue }
+        if (-not (Test-Path -LiteralPath $m3u)) {
+            Write-Warning "M3U nao encontrado: $m3u"
+            continue
+        }
+
+        $entries = Get-M3uEntries $m3u
+        $sorted = @()
+
+        foreach ($entry in $entries) {
+            $item = $entry.Trim()
+            if ([string]::IsNullOrWhiteSpace($item)) { continue }
+            $sorted += $item
+        }
+
+        $sorted = $sorted | Sort-Object {
+            $leaf = Split-Path $_ -Leaf
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+            Get-ChaveOrdenacao $base
+        }
+
+        Set-M3uEntries $m3u $sorted
+        Write-Success "M3U corrigido e ordenado: $m3u"
+    }
 }
 
 function Invoke-Modulo4-BaixarFaltantes {
     Clear-Host
     Write-Header "MODULO 4 - BAIXAR FALTANTES"
-    if (-not (Test-Spotdl)) { Write-ErrorMsg "spotdl nao encontrado"; return }
-    Write-Success "Modulo 4 pronto"
+
+    if (-not (Test-Spotdl)) {
+        Write-ErrorMsg "spotdl nao encontrado"
+        return
+    }
+
+    foreach ($p in $playlists) {
+        if (-not (Test-Path -LiteralPath $p.Folder)) {
+            Write-ErrorMsg "Pasta nao existe: $($p.Folder)"
+            continue
+        }
+
+        $faltantes = Get-PlaylistMissingEntries $p
+        if ($faltantes.Count -eq 0) {
+            Write-Success "Nada para baixar em: $($p.Nome)"
+            continue
+        }
+
+        Write-Section "Baixando faltantes de $($p.Nome)"
+        foreach ($item in $faltantes) {
+            $title = if ($item.Title) { $item.Title } else { "titulo indefinido" }
+            $url = $item.Url
+            if (-not $url) {
+                $url = Convert-UriToUrl $item.Raw.Uri
+            }
+
+            if (-not $url) {
+                Write-Warning "Sem URL valida para: $title"
+                continue
+            }
+
+            Write-Info "Baixando: $title"
+            $ok = Invoke-SpotifyDownload $url $p.Folder
+            if ($ok) {
+                Write-Success "Download concluido: $title"
+            }
+            else {
+                Write-ErrorMsg "Erro ao baixar: $title"
+            }
+        }
+    }
+}
+
+function Invoke-FluxoCompleto {
+    Invoke-Modulo2-RemoverDuplicatas
+    Invoke-Modulo3-CorrigirM3u
+    Invoke-Modulo4-BaixarFaltantes
 }
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -226,9 +538,7 @@ Add-BotaoModulo "4. Baixar musicas faltantes" "Download de faltantes" $y $corBtn
 
 $y += 90
 Add-BotaoModulo "5. Fluxo completo (2-3-4)" "Limpa, ordena e baixa" $y $corBtnFluxo {
-    Invoke-Modulo2-RemoverDuplicatas
-    Invoke-Modulo3-CorrigirM3u
-    Invoke-Modulo4-BaixarFaltantes
+    Invoke-FluxoCompleto
 }
 
 $y += 90
